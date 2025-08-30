@@ -2,11 +2,15 @@ name: Bili to Telegram
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    - cron: "*/5 * * * *"   # 每 5 分钟运行
+  workflow_dispatch:        # 支持手动触发
 
 permissions:
   contents: write
+
+concurrency:
+  group: bili-telegram
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -15,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 拉全历史，便于 rebase 推送 state.json
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,16 +36,26 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          BILI_UIDS: ${{ secrets.BILI_UIDS }}
+          BILI_UIDS: ${{ secrets.BILI_UIDS }}   # 形如：1703797642,11992016
         run: |
           python notifier.py
 
-      - name: Commit state
+      - name: Commit state (if changed)
         run: |
+          git config --global safe.directory /github/workspace
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 同步远端，避免 push 被拒绝
+          git fetch origin
+          CURRENT_BRANCH="${GITHUB_REF_NAME:-main}"
+          git checkout "$CURRENT_BRANCH"
+          git pull --rebase origin "$CURRENT_BRANCH" || true
+
           if [ -n "$(git status --porcelain)" ]; then
             git add state.json
-            git commit -m "update state"
-            git push
+            git commit -m "chore: update state [skip ci]" || true
+            git push origin HEAD:"$CURRENT_BRANCH"
+          else
+            echo "No changes to commit"
           fi
