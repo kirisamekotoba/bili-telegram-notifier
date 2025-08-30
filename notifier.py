@@ -1,37 +1,41 @@
 import os, json, time, random
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
 import requests
 
-# ====== 配置 / 环境 ======
+# ====== 环境变量 ======
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID   = os.environ["TG_CHAT_ID"]
-# 依旧使用 BILI_UIDS（用逗号分隔），表示要监控的 UP 主 UID
-BILI_UIDS    = [u.strip() for u in os.environ["BILI_UIDS"].split(",") if u.strip()]
+
+# 以逗号分隔的房间号列表；例如： "22966160,12345"
+BILI_ROOMS   = [r.strip() for r in os.environ.get("BILI_ROOMS", "").split(",") if r.strip()]
 
 STATE_FILE = Path("state.json")
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Actions; BiliLive/1.0)",
+    "User-Agent": "Mozilla/5.0 (Actions; BiliLiveRoom/1.0)",
     "Accept": "application/json, */*;q=0.1",
     "Referer": "https://live.bilibili.com/",
     "Origin": "https://live.bilibili.com",
 })
 
-# ====== 工具 ======
+# 官方房间信息接口（无需登录）：可批量查询
+# 文档行为：room_ids 用逗号分隔；req_biz 传 "video" 即可
+API_ROOM_BATCH = "https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?room_ids={room_ids}&req_biz=video"
+
 def log(msg: str): print(msg, flush=True)
 
 def load_state() -> Dict:
     if STATE_FILE.exists():
         try:
             data = json.loads(STATE_FILE.read_text("utf-8"))
-            if "live_status" in data:
+            # 结构：{"live_status_by_room": {room_id: 0/1}, "title_by_room": {room_id: "..."}}
+            if "live_status_by_room" in data:
                 return data
         except Exception as e:
             log(f"[WARN] load_state failed: {e}")
-    # 结构：{"live_status": {uid: 0/1}, "room": {uid: room_id}}
-    return {"live_status": {}, "room": {}}
+    return {"live_status_by_room": {}, "title_by_room": {}}
 
 def save_state(state: Dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), "utf-8")
@@ -47,108 +51,101 @@ def send_telegram(text: str, disable_preview=False):
     r.raise_for_status()
     return r.json()
 
-def format_live_on(uid: str, title: str, room_id: int):
+def format_live_on(room_id: str, title: Optional[str]):
     url = f"https://live.bilibili.com/{room_id}"
-    head = f"🟢 <b>UP {uid} 开播啦</b>"
+    head = f"🟢 <b>直播间 {room_id} 开播</b>"
     body = f"🎯 {title}" if title else "🎯 直播开始"
     return f"{head}\n{body}\n🔗 {url}"
 
-def format_live_off(uid: str, room_id: int, title: Optional[str] = None):
+def format_live_off(room_id: str, title: Optional[str]):
     url = f"https://live.bilibili.com/{room_id}"
-    head = f"⚪ <b>UP {uid} 已下播</b>"
-    tail = f"\n🔗 {url}"
+    head = f"⚪ <b>直播间 {room_id} 下播</b>"
     if title:
-        return f"{head}\n📝 {title}{tail}"
-    return f"{head}{tail}"
+        return f"{head}\n📝 {title}\n🔗 {url}"
+    return f"{head}\n🔗 {url}"
 
-# ====== 数据源（尽量稳健）======
-# 1) 首选：空间信息接口，含 live_room 区块（无需登录）
-ACC_INFO = "https://api.bilibili.com/x/space/acc/info?mid={uid}&jsonp=jsonp"
-
-# 2) 兜底：旧接口，通过 uid 拿房间 id 与状态
-ROOM_INFO_OLD = "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid={uid}"
-
-def get_live_info(uid: str):
+def fetch_rooms_info(room_ids: List[str]) -> Dict[str, Tuple[int, str]]:
     """
-    返回 (status, room_id, title)
-    status: 0 未开播 / 1 开播
-    若拿不到，返回 (None, None, None)
+    返回 {room_id: (live_status, title)} ；live_status: 0 未开播 / 1 开播
     """
-    # 首先尝试 acc_info
-    try:
-        r = SESSION.get(ACC_INFO.format(uid=uid), timeout=15)
-        r.raise_for_status()
-        j = r.json()
-        live = (j.get("data") or {}).get("live_room") or {}
-        room_id = live.get("roomid") or live.get("room_id")
-        status  = live.get("liveStatus") or live.get("live_status") or live.get("status")
-        title   = live.get("title")
-        # 部分字段命名差异处理
-        if status in (0, 1) and room_id:
-            return int(status), int(room_id), (title or "")
-    except Exception as e:
-        log(f"[WARN] acc_info failed for {uid}: {e}")
+    info: Dict[str, Tuple[int, str]] = {}
+    if not room_ids:
+        return info
+    # 分批（接口支持最多 50～100 个；我们通常很少）
+    batch = ",".join(room_ids)
+    url = API_ROOM_BATCH.format(room_ids=batch)
+    r = SESSION.get(url, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    data = (j.get("data") or {}).get("room_info_list") or []
+    for it in data:
+        rid = str(it.get("room_id") or it.get("roomid") or "")
+        if not rid:
+            continue
+        status = int(it.get("live_status") or 0)  # 0 / 1
+        title  = (it.get("title") or "").strip()
+        info[rid] = (status, title)
+    log(f"[INFO] fetched {len(info)}/{len(room_ids)} room infos")
+    return info
 
-    # 再尝试旧接口
-    try:
-        r = SESSION.get(ROOM_INFO_OLD.format(uid=uid), timeout=15)
-        r.raise_for_status()
-        j = r.json()
-        data = j.get("data") or {}
-        room_id = data.get("roomid") or data.get("room_id")
-        status  = data.get("liveStatus") or data.get("live_status")
-        title   = data.get("title") or ""
-        if status in (0, 1) and room_id:
-            return int(status), int(room_id), title
-    except Exception as e:
-        log(f"[WARN] room_info_old failed for {uid}: {e}")
-
-    return None, None, None
-
-# ====== 主流程：只在状态变化时推送 ======
 def main():
+    # 从 Secrets 中拿房间号
+    rooms = BILI_ROOMS
+    if not rooms:
+        log("[ERROR] No BILI_ROOMS provided (comma-separated room ids).")
+        return
+
     state = load_state()
-    last = state.get("live_status", {})
-    rooms = state.get("room", {})
+    last_status: Dict[str, int] = state.get("live_status_by_room", {})
+    last_title:  Dict[str, str] = state.get("title_by_room", {})
 
     changed = False
 
-    for uid in BILI_UIDS:
-        log(f"[INFO] Checking live status for UID {uid} …")
-        status, room_id, title = get_live_info(uid)
-        if status is None:
-            log(f"[INFO]   no live info for {uid}")
+    # 拉取当前状态
+    try:
+        current = fetch_rooms_info(rooms)
+    except Exception as e:
+        log(f"[ERROR] fetch rooms failed: {e}")
+        return
+
+    for rid in rooms:
+        rid_str = str(rid)
+        if rid_str not in current:
+            log(f"[INFO]   no info for room {rid_str}")
             continue
 
-        prev = last.get(uid)
-        rooms[uid] = room_id  # 记录房间号以便下播时也能给链接
+        status, title = current[rid_str]
+        prev = last_status.get(rid_str)
 
         if prev is None:
-            # 第一次见到，记录状态但不推送，避免历史状态误报
-            last[uid] = status
-            log(f"[INFO]   initial state for {uid}: {status}")
+            # 第一次见到，只记录，不推送
+            last_status[rid_str] = status
+            last_title[rid_str]  = title
+            log(f"[INFO]   initial state room {rid_str}: {status}")
             continue
 
         if status != prev:
-            # 发生变化：0->1 开播，1->0 下播
             try:
                 if status == 1:
-                    send_telegram(format_live_on(uid, title, room_id))
+                    send_telegram(format_live_on(rid_str, title))
                 else:
-                    send_telegram(format_live_off(uid, room_id, title))
-                log(f"[OK]   pushed status change for {uid}: {prev} -> {status}")
-                last[uid] = status
+                    # 下播时带上最后一次标题（如果当前标题为空）
+                    send_telegram(format_live_off(rid_str, title or last_title.get(rid_str)))
+                log(f"[OK]   room {rid_str} status change: {prev} -> {status}")
+                last_status[rid_str] = status
+                last_title[rid_str]  = title or last_title.get(rid_str, "")
                 changed = True
             except Exception as e:
-                log(f"[ERROR] telegram push failed for {uid}: {e}")
+                log(f"[ERROR] telegram push failed for room {rid_str}: {e}")
         else:
-            log(f"[INFO]   unchanged for {uid}: {status}")
+            # 状态没变，更新一下标题缓存
+            last_title[rid_str] = title or last_title.get(rid_str, "")
+            log(f"[INFO]   room {rid_str} unchanged: {status}")
 
-        # 小小节流，避免接口触发风控
-        time.sleep(0.3 + random.random() * 0.3)
+        time.sleep(0.2 + random.random() * 0.2)
 
-    state["live_status"] = last
-    state["room"] = rooms
+    state["live_status_by_room"] = last_status
+    state["title_by_room"]       = last_title
     save_state(state)
 
     if not changed:
