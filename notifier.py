@@ -1,42 +1,39 @@
-import os, json, time, hashlib, random
+import os, json, time, random
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, Optional
 import requests
 
+# ====== 配置 / 环境 ======
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID   = os.environ["TG_CHAT_ID"]
+# 依旧使用 BILI_UIDS（用逗号分隔），表示要监控的 UP 主 UID
 BILI_UIDS    = [u.strip() for u in os.environ["BILI_UIDS"].split(",") if u.strip()]
+
 STATE_FILE = Path("state.json")
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Actions; BiliDyn/2.0)",
-    "Accept": "application/json, text/xml, */*;q=0.1",
-    "Referer": "https://t.bilibili.com/",
+    "User-Agent": "Mozilla/5.0 (Actions; BiliLive/1.0)",
+    "Accept": "application/json, */*;q=0.1",
+    "Referer": "https://live.bilibili.com/",
+    "Origin": "https://live.bilibili.com",
 })
 
-API_POLYMER = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={uid}"
-RSS_ORIGIN  = "https://rsshub.app/bilibili/user/dynamic/{uid}"  # 兜底
+# ====== 工具 ======
+def log(msg: str): print(msg, flush=True)
 
-def log(msg: str):
-    print(msg, flush=True)
-
-def load_state():
-    # 兼容旧结构：如果原来是 {"seen": {...}} 也能读
+def load_state() -> Dict:
     if STATE_FILE.exists():
         try:
             data = json.loads(STATE_FILE.read_text("utf-8"))
-            if "last_dyn" in data:
+            if "live_status" in data:
                 return data
-            elif "seen" in data:  # 旧版迁移成 last_dyn
-                # 取每个 uid 已见列表的最后一项作为 last_dyn
-                last_dyn = {k: (v[-1] if isinstance(v, list) and v else None) for k, v in data["seen"].items()}
-                return {"last_dyn": last_dyn}
         except Exception as e:
             log(f"[WARN] load_state failed: {e}")
-    return {"last_dyn": {}}  # { uid: last_dynamic_id }
+    # 结构：{"live_status": {uid: 0/1}, "room": {uid: room_id}}
+    return {"live_status": {}, "room": {}}
 
-def save_state(state):
+def save_state(state: Dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), "utf-8")
 
 def send_telegram(text: str, disable_preview=False):
@@ -50,118 +47,112 @@ def send_telegram(text: str, disable_preview=False):
     r.raise_for_status()
     return r.json()
 
-def format_msg(uid: str, title: str, url: Optional[str]):
-    head = f"👀 <b>UP {uid} 有新动态</b>"
-    body = f"📝 {title}" if title else "📝 新动态"
-    tail = f"\n🔗 {url}" if url else ""
-    return f"{head}\n{body}{tail}"
+def format_live_on(uid: str, title: str, room_id: int):
+    url = f"https://live.bilibili.com/{room_id}"
+    head = f"🟢 <b>UP {uid} 开播啦</b>"
+    body = f"🎯 {title}" if title else "🎯 直播开始"
+    return f"{head}\n{body}\n🔗 {url}"
 
-def retry_get(url, tries=3, backoff_base=0.8):
-    last = None
-    for i in range(tries):
-        try:
-            r = SESSION.get(url, timeout=15)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last = e
-            sleep = backoff_base * (2 ** i) + random.random() * 0.3
-            log(f"[WARN] GET {url} failed (try {i+1}/{tries}): {e} -> sleep {sleep:.1f}s")
-            time.sleep(sleep)
-    raise last
+def format_live_off(uid: str, room_id: int, title: Optional[str] = None):
+    url = f"https://live.bilibili.com/{room_id}"
+    head = f"⚪ <b>UP {uid} 已下播</b>"
+    tail = f"\n🔗 {url}"
+    if title:
+        return f"{head}\n📝 {title}{tail}"
+    return f"{head}{tail}"
 
-def fetch_polymer(uid: str) -> List[Tuple[str,str,Optional[str]]]:
+# ====== 数据源（尽量稳健）======
+# 1) 首选：空间信息接口，含 live_room 区块（无需登录）
+ACC_INFO = "https://api.bilibili.com/x/space/acc/info?mid={uid}&jsonp=jsonp"
+
+# 2) 兜底：旧接口，通过 uid 拿房间 id 与状态
+ROOM_INFO_OLD = "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid={uid}"
+
+def get_live_info(uid: str):
     """
-    只抓“动态/说说”，返回按时间从新到旧的列表：
-    [(dynamic_id_str, title_text, link)]
+    返回 (status, room_id, title)
+    status: 0 未开播 / 1 开播
+    若拿不到，返回 (None, None, None)
     """
+    # 首先尝试 acc_info
     try:
-        r = retry_get(API_POLYMER.format(uid=uid), tries=2)
-        data = r.json()
-        items = (data.get("data") or {}).get("items") or []
-        results = []
-        for it in items:
-            id_str = str(it.get("id_str") or it.get("id") or "")
-            if not id_str:
-                continue
-            modules = it.get("modules") or {}
-            desc = (modules.get("module_dynamic") or {}).get("desc") or {}
-            title = desc.get("text") or "B站动态"
-            link  = f"https://t.bilibili.com/{id_str}"
-            results.append((id_str, title, link))
-        log(f"[INFO] polymer items for {uid}: {len(results)}")
-        return results  # polymer 默认已是新→旧
+        r = SESSION.get(ACC_INFO.format(uid=uid), timeout=15)
+        r.raise_for_status()
+        j = r.json()
+        live = (j.get("data") or {}).get("live_room") or {}
+        room_id = live.get("roomid") or live.get("room_id")
+        status  = live.get("liveStatus") or live.get("live_status") or live.get("status")
+        title   = live.get("title")
+        # 部分字段命名差异处理
+        if status in (0, 1) and room_id:
+            return int(status), int(room_id), (title or "")
     except Exception as e:
-        log(f"[WARN] polymer failed for {uid}: {e}")
-        return []
+        log(f"[WARN] acc_info failed for {uid}: {e}")
 
-def fetch_rss(uid: str) -> List[Tuple[str,str,Optional[str]]]:
-    """
-    RSS 兜底，返回新→旧（按 item 顺序近似）
-    用 title+link 做一个稳定 hash 作为伪ID并存入 id_str，以便去重。
-    """
+    # 再尝试旧接口
     try:
-        r = retry_get(RSS_ORIGIN.format(uid=uid), tries=2, backoff_base=1.2)
-        text = r.text
-        blocks = text.split("<item>")[1:10]
-        results = []
-        for block in blocks:
-            title = "B站动态"
-            if "<title>" in block and "</title>" in block:
-                title = block.split("<title>",1)[1].split("</title>",1)[0].strip()
-            link = None
-            if "<link>" in block and "</link>" in block:
-                link = block.split("<link>",1)[1].split("</link>",1)[0].strip()
-            raw = (title or "") + "|" + (link or "") + "|" + block[:200]
-            id_str = hashlib.md5(raw.encode("utf-8")).hexdigest()
-            results.append((id_str, title, link))
-        log(f"[INFO] rss items for {uid}: {len(results)}")
-        return results
+        r = SESSION.get(ROOM_INFO_OLD.format(uid=uid), timeout=15)
+        r.raise_for_status()
+        j = r.json()
+        data = j.get("data") or {}
+        room_id = data.get("roomid") or data.get("room_id")
+        status  = data.get("liveStatus") or data.get("live_status")
+        title   = data.get("title") or ""
+        if status in (0, 1) and room_id:
+            return int(status), int(room_id), title
     except Exception as e:
-        log(f"[WARN] rss failed for {uid}: {e}")
-        return []
+        log(f"[WARN] room_info_old failed for {uid}: {e}")
 
+    return None, None, None
+
+# ====== 主流程：只在状态变化时推送 ======
 def main():
     state = load_state()
-    last_dyn = state.get("last_dyn", {})
+    last = state.get("live_status", {})
+    rooms = state.get("room", {})
 
-    pushed_any = False
+    changed = False
 
     for uid in BILI_UIDS:
-        log(f"[INFO] Fetching UID {uid}…")
-
-        # 先 polymer，再 RSS 兜底
-        items = fetch_polymer(uid)
-        if not items:
-            items = fetch_rss(uid)
-
-        if not items:
-            log(f"[INFO] no items for {uid}")
+        log(f"[INFO] Checking live status for UID {uid} …")
+        status, room_id, title = get_live_info(uid)
+        if status is None:
+            log(f"[INFO]   no live info for {uid}")
             continue
 
-        # 只推送“最新一条 且 之前没推送过”的那条
-        # items 已是新→旧，取第一条与 last_dyn[uid] 比较
-        newest_id, newest_title, newest_link = items[0]
-        last_id = last_dyn.get(uid)
+        prev = last.get(uid)
+        rooms[uid] = room_id  # 记录房间号以便下播时也能给链接
 
-        if newest_id and newest_id != last_id:
-            # 推送这 1 条
+        if prev is None:
+            # 第一次见到，记录状态但不推送，避免历史状态误报
+            last[uid] = status
+            log(f"[INFO]   initial state for {uid}: {status}")
+            continue
+
+        if status != prev:
+            # 发生变化：0->1 开播，1->0 下播
             try:
-                send_telegram(format_msg(uid, newest_title, newest_link))
-                log(f"[OK] pushed newest {uid}/{newest_id}")
-                last_dyn[uid] = newest_id
-                pushed_any = True
+                if status == 1:
+                    send_telegram(format_live_on(uid, title, room_id))
+                else:
+                    send_telegram(format_live_off(uid, room_id, title))
+                log(f"[OK]   pushed status change for {uid}: {prev} -> {status}")
+                last[uid] = status
+                changed = True
             except Exception as e:
-                log(f"[ERROR] push failed for {uid}/{newest_id}: {e}")
+                log(f"[ERROR] telegram push failed for {uid}: {e}")
         else:
-            log(f"[INFO] newest unchanged for {uid} (newest={newest_id}, last={last_id})")
+            log(f"[INFO]   unchanged for {uid}: {status}")
 
-    # 保存 last_dyn
-    state["last_dyn"] = last_dyn
+        # 小小节流，避免接口触发风控
+        time.sleep(0.3 + random.random() * 0.3)
+
+    state["live_status"] = last
+    state["room"] = rooms
     save_state(state)
 
-    if not pushed_any:
-        log("[INFO] No new updates to push")
+    if not changed:
+        log("[INFO] No live status changes")
 
 if __name__ == "__main__":
     main()
