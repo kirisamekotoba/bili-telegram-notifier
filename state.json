@@ -1,4 +1,4 @@
 {
-  "live_status": {},
-  "room": {}
+  "live_status_by_room": {},
+  "title_by_room": {}
 }
